@@ -251,7 +251,7 @@ app = FastAPI(title="alpha filter agent", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://38.49.214.231:3000","http://localhost:3000"],  # tighten later
+    allow_origins=["*"],  # tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
