@@ -3,6 +3,7 @@ import re
 import uuid
 import os
 import time
+import socket
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -19,16 +20,15 @@ load_dotenv()
 # -----------------------------
 OG_PRIVATE_KEY = os.environ.get("OG_PRIVATE_KEY")
 if not OG_PRIVATE_KEY:
-    raise RuntimeError("missing OG_PRIVATE_KEY in server/.env")
+    raise RuntimeError("missing OG_PRIVATE_KEY in environment")
 
 OG_TEE_LLM_MODEL = os.environ.get("OG_TEE_LLM_MODEL", "GPT_4O")
 OG_OPG_APPROVAL_AMOUNT = float(os.environ.get("OG_OPG_APPROVAL_AMOUNT", "5.0"))
 OG_X402_SETTLEMENT_MODE = os.environ.get("OG_X402_SETTLEMENT_MODE", "SETTLE_METADATA")
 
-# map env string -> sdk enum (keep it strict so you don't silently misconfigure)
 TEE_LLM_MAP = {
     "GPT_4O": og.TEE_LLM.GPT_4O,
-    "O4_MINI": getattr(og.TEE_LLM, "O4_MINI", og.TEE_LLM.GPT_4O),  # fallback
+    "O4_MINI": getattr(og.TEE_LLM, "O4_MINI", og.TEE_LLM.GPT_4O),
     "GEMINI_2_0_FLASH": getattr(og.TEE_LLM, "GEMINI_2_0_FLASH", og.TEE_LLM.GPT_4O),
     "CLAUDE_3_5_HAIKU": og.TEE_LLM.CLAUDE_3_5_HAIKU,
     "CLAUDE_3_7_SONNET": getattr(og.TEE_LLM, "CLAUDE_3_7_SONNET", og.TEE_LLM.CLAUDE_3_5_HAIKU),
@@ -52,11 +52,10 @@ if SETTLEMENT_MODE is None:
         f"valid: {', '.join(SETTLEMENT_MAP.keys())}"
     )
 
-# initialize opengradient client (route 1)
+# initialize client
 client = og.init(private_key=OG_PRIVATE_KEY)
 
-# ensure permit2 approval once at boot (only sends tx if needed)
-# documented in the llm guide.
+# ensure approval once at boot
 client.llm.ensure_opg_approval(opg_amount=OG_OPG_APPROVAL_AMOUNT)
 
 # -----------------------------
@@ -64,13 +63,15 @@ client.llm.ensure_opg_approval(opg_amount=OG_OPG_APPROVAL_AMOUNT)
 # -----------------------------
 class AnalyzeRequest(BaseModel):
     content: str = Field(..., min_length=5, description="tweet/announcement text to analyze")
-    context: Optional[str] = Field(None, description="optional extra context (e.g., project name, chain, link summary)")
+    context: Optional[str] = Field(None, description="optional extra context")
     strict: bool = Field(True, description="if true, model must output strict json only")
+
 
 class Claim(BaseModel):
     claim: str
     verifiable: bool
     verify_with: str
+
 
 class AnalysisResponse(BaseModel):
     signal_score: int
@@ -81,6 +82,7 @@ class AnalysisResponse(BaseModel):
     missing_info_questions: List[str]
     claims: List[Claim]
     proof: Dict[str, Any]
+
 
 # -----------------------------
 # prompt
@@ -119,6 +121,8 @@ risk_flags (multi-label, pick any that apply):
 - vague timeline
 - misleading comparison
 
+verifiable=true if a claim could be checked using public evidence, even if the evidence is not included in the text.
+
 output requirements:
 return valid json only, no markdown, no extra keys.
 ensure integers are within range and are ints (not strings).
@@ -139,6 +143,7 @@ json format:
 }
 """
 
+
 def _build_messages(content: str, context: Optional[str], strict: bool) -> List[Dict[str, str]]:
     user_payload = f"text to analyze:\n{content.strip()}\n"
     if context:
@@ -153,14 +158,13 @@ def _build_messages(content: str, context: Optional[str], strict: bool) -> List[
         {"role": "user", "content": user_payload},
     ]
 
+
 def _extract_text(raw: Any) -> str:
-    # OpenGradient chat_output may be a string OR an OpenAI-style dict
     if raw is None:
         return ""
     if isinstance(raw, str):
         return raw
     if isinstance(raw, dict):
-        # common: {"choices":[{"message":{"content":"..."}}]}
         try:
             choices = raw.get("choices")
             if isinstance(choices, list) and choices:
@@ -170,52 +174,44 @@ def _extract_text(raw: Any) -> str:
                     return content
         except Exception:
             pass
-        # fallback: some payloads may carry text elsewhere
+
         for k in ("content", "text", "output"):
             v = raw.get(k)
             if isinstance(v, str):
                 return v
         return json.dumps(raw)
-    # last resort
+
     return str(raw)
 
 
 def _safe_json_loads(s: Any) -> Dict[str, Any]:
-    # accept either string or dict; normalize to string
     if isinstance(s, dict):
-        # if the model already returned a parsed dict, use it
         return s
 
     s = _extract_text(s).strip()
-    # try direct
     try:
         return json.loads(s)
     except Exception:
         pass
-    # try to slice first {...} block
+
     start = s.find("{")
     end = s.rfind("}")
     if start != -1 and end != -1 and end > start:
-        return json.loads(s[start : end + 1])
+        return json.loads(s[start:end + 1])
+
     raise ValueError("could not parse json")
 
+
 def _clamp_int(x: Any, lo: int, hi: int, name: str) -> int:
-    """Coerce model output into an int in [lo, hi].
-    Accepts ints, floats, numeric strings, and strings like '15%' or '15/100'.
-    Never raises.
-    """
     if x is None:
         return lo
     if isinstance(x, bool):
         return lo
-
-    # already numeric
     if isinstance(x, int):
         return max(lo, min(hi, x))
     if isinstance(x, float):
         return max(lo, min(hi, int(round(x))))
 
-    # string / other -> extract first number
     s = str(x).strip()
     m = re.search(r"-?\d+(?:\.\d+)?", s)
     if not m:
@@ -226,16 +222,16 @@ def _clamp_int(x: Any, lo: int, hi: int, name: str) -> int:
     except Exception:
         return lo
 
+
 def _normalize_flags(flags: Any) -> List[str]:
-    if not flags:
+    if not flags or not isinstance(flags, list):
         return []
-    if not isinstance(flags, list):
-        return []
+
     out = []
     for f in flags:
         if isinstance(f, str):
             out.append(f.strip().lower())
-    # de-dupe
+
     seen = set()
     deduped = []
     for f in out:
@@ -244,6 +240,38 @@ def _normalize_flags(flags: Any) -> List[str]:
             deduped.append(f)
     return deduped
 
+
+def _is_dns_like_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "no address associated with hostname" in msg
+        or "temporary failure in name resolution" in msg
+        or "name or service not known" in msg
+        or isinstance(exc, socket.gaierror)
+    )
+
+
+def run_llm_with_retry(messages: List[Dict[str, str]], *, max_tokens: int = 650, temperature: float = 0.0):
+    last_err = None
+
+    for attempt in range(4):
+        try:
+            return client.llm.chat(
+                model=MODEL,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                x402_settlement_mode=SETTLEMENT_MODE,
+            )
+        except Exception as e:
+            last_err = e
+            if not _is_dns_like_error(e) or attempt == 3:
+                raise
+            time.sleep(2 * (attempt + 1))
+
+    raise last_err
+
+
 # -----------------------------
 # app
 # -----------------------------
@@ -251,72 +279,71 @@ app = FastAPI(title="alpha filter agent", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+@app.get("/")
+def root():
+    return {
+        "name": "alpha-filter-agent",
+        "status": "ok",
+        "endpoints": ["/health", "/analyze"],
+    }
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return {}
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.post("/analyze", response_model=AnalysisResponse)
 def analyze(req: AnalyzeRequest):
     messages = _build_messages(req.content, req.context, req.strict)
 
     try:
-        # direct sdk route:
-        # - chat is tee verified
-        # - payment_hash returned (used as proof handle)
-        result = client.llm.chat(
-            model=MODEL,
-            messages=messages,
-            max_tokens=650,
-            temperature=0.0,
-            x402_settlement_mode=SETTLEMENT_MODE,
-        )
+        result = run_llm_with_retry(messages)
     except Exception as e:
+        if _is_dns_like_error(e):
+            raise HTTPException(
+                status_code=503,
+                detail="opengradient gateway temporarily unavailable, please retry"
+            )
         raise HTTPException(status_code=500, detail=f"opengradient llm call failed: {e}")
 
-    # sdk quickstart shows chat output on response.chat_output
-    # llm doc also shows payment_hash on outputs
     raw = getattr(result, "chat_output", None) or getattr(result, "completion_output", None)
     if raw is None:
         raise HTTPException(status_code=500, detail="no chat_output returned from model")
 
     raw_text = _extract_text(raw)
-    if not raw_text.strip() and isinstance(raw, dict):
-        # if dict has no text, still try to parse as dict
-        pass
 
     try:
         data = _safe_json_loads(raw_text if raw_text else raw)
     except Exception as e:
-        # one retry: ask model to repair into strict json
         repair_messages = [
             {"role": "system", "content": "repair the following into valid json matching the required schema. output json only."},
-            {"role": "user", "content": raw_text if "raw_text" in locals() else str(raw)},
+            {"role": "user", "content": raw_text if raw_text else str(raw)},
         ]
         try:
-            repair = client.llm.chat(
-                model=MODEL,
-                messages=repair_messages,
-                max_tokens=650,
-                temperature=0.0,
-                x402_settlement_mode=SETTLEMENT_MODE,
-            )
+            repair = run_llm_with_retry(repair_messages)
             repaired_raw = getattr(repair, "chat_output", None) or ""
             data = _safe_json_loads(repaired_raw)
         except Exception as e2:
             raise HTTPException(status_code=500, detail=f"json parse failed: {e} / repair failed: {e2}")
 
-    # normalize + validate
     signal = _clamp_int(data.get("signal_score"), 0, 100, "signal_score")
     substance = _clamp_int(data.get("substance_score"), 0, 100, "substance_score")
     fluff = _clamp_int(data.get("fluff_percent"), 0, 100, "fluff_percent")
 
-    verdict = (data.get("verdict") or "").strip()
+    verdict = (data.get("verdict") or "").strip() if isinstance(data.get("verdict"), str) else ""
     if not verdict:
         verdict = "no verdict returned."
 
@@ -335,43 +362,50 @@ def analyze(req: AnalyzeRequest):
             verify_with = (c.get("verify_with") or "").strip()
             verifiable = bool(c.get("verifiable")) if claim_txt else False
             if claim_txt:
-                claims.append(Claim(claim=claim_txt, verifiable=verifiable, verify_with=verify_with or "n/a"))
+                claims.append(
+                    Claim(
+                        claim=claim_txt,
+                        verifiable=verifiable,
+                        verify_with=verify_with or "n/a",
+                    )
+                )
 
     flags = _normalize_flags(data.get("risk_flags"))
 
-    # collect proof fields across sdk versions
-    proof = {
+    proof: Dict[str, Any] = {
         "verification": "tee",
         "model": str(OG_TEE_LLM_MODEL),
         "x402_settlement_mode": str(OG_X402_SETTLEMENT_MODE),
         "generated_at_unix": int(time.time()),
     }
 
-    # best-effort: different sdk versions may expose different attribute names
     for k in [
-        "payment_hash","paymentHash","x402_payment_hash","x402PaymentHash",
-        "payment_id","paymentId","receipt","settlement_metadata","settlementMetadata","metadata",
-        "transaction_hash","transactionHash"
+        "payment_hash", "paymentHash", "x402_payment_hash", "x402PaymentHash",
+        "payment_id", "paymentId", "receipt", "settlement_metadata", "settlementMetadata",
+        "metadata", "transaction_hash", "transactionHash"
     ]:
         if hasattr(result, k):
             proof[k] = getattr(result, k)
 
-    # one canonical handle for UI
-        receipt_id = str(uuid.uuid4())
-    proof["receipt_id"] = receipt_id
+    proof["receipt_id"] = str(uuid.uuid4())
 
-    proof_handle = proof.get("payment_hash") or proof.get("paymentHash") or proof.get("transaction_hash") or proof.get("transactionHash")
-    # if sdk returns the string "external", treat it as not available
+    proof_handle = (
+        proof.get("payment_hash")
+        or proof.get("paymentHash")
+        or proof.get("transaction_hash")
+        or proof.get("transactionHash")
+    )
     if isinstance(proof_handle, str) and proof_handle.lower() == "external":
         proof_handle = None
     proof["proof_handle"] = proof_handle
 
-    # also include a list of top-level keys if the result is dict-like
     if isinstance(result, dict):
         proof["result_keys"] = list(result.keys())
     else:
-        proof["result_attrs"] = [a for a in dir(result) if any(x in a.lower() for x in ["pay", "hash", "receipt", "settle", "meta"])]
-
+        proof["result_attrs"] = [
+            a for a in dir(result)
+            if any(x in a.lower() for x in ["pay", "hash", "receipt", "settle", "meta"])
+        ]
 
     return AnalysisResponse(
         signal_score=signal,
