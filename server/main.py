@@ -4,6 +4,7 @@ import uuid
 import os
 import time
 import socket
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -25,6 +26,10 @@ if not OG_PRIVATE_KEY:
 OG_TEE_LLM_MODEL = os.environ.get("OG_TEE_LLM_MODEL", "GPT_4O")
 OG_OPG_APPROVAL_AMOUNT = float(os.environ.get("OG_OPG_APPROVAL_AMOUNT", "5.0"))
 OG_X402_SETTLEMENT_MODE = os.environ.get("OG_X402_SETTLEMENT_MODE", "SETTLE_METADATA")
+
+# hostname + ip fallback
+OG_LLM_HOSTNAME = os.environ.get("OG_LLM_HOSTNAME", "llm.opengradient.ai")
+OG_LLM_FALLBACK_IP = os.environ.get("OG_LLM_FALLBACK_IP", "3.15.214.21")
 
 TEE_LLM_MAP = {
     "GPT_4O": og.TEE_LLM.GPT_4O,
@@ -241,35 +246,34 @@ def _normalize_flags(flags: Any) -> List[str]:
     return deduped
 
 
-def _is_dns_like_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return (
-        "no address associated with hostname" in msg
-        or "temporary failure in name resolution" in msg
-        or "name or service not known" in msg
-        or isinstance(exc, socket.gaierror)
-    )
+@contextmanager
+def hostname_ip_fallback(hostname: str, fallback_ip: str):
+    original_getaddrinfo = socket.getaddrinfo
 
-
-def run_llm_with_retry(messages: List[Dict[str, str]], *, max_tokens: int = 650, temperature: float = 0.0):
-    last_err = None
-
-    for attempt in range(4):
+    def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         try:
-            return client.llm.chat(
-                model=MODEL,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                x402_settlement_mode=SETTLEMENT_MODE,
-            )
-        except Exception as e:
-            last_err = e
-            if not _is_dns_like_error(e) or attempt == 3:
-                raise
-            time.sleep(2 * (attempt + 1))
+            return original_getaddrinfo(host, port, family, type, proto, flags)
+        except socket.gaierror:
+            if host == hostname and fallback_ip:
+                return original_getaddrinfo(fallback_ip, port, family, type, proto, flags)
+            raise
 
-    raise last_err
+    socket.getaddrinfo = patched_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+
+
+def run_llm_with_hostname_fallback(messages: List[Dict[str, str]], *, max_tokens: int = 650, temperature: float = 0.0):
+    with hostname_ip_fallback(OG_LLM_HOSTNAME, OG_LLM_FALLBACK_IP):
+        return client.llm.chat(
+            model=MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            x402_settlement_mode=SETTLEMENT_MODE,
+        )
 
 
 # -----------------------------
@@ -310,13 +314,8 @@ def analyze(req: AnalyzeRequest):
     messages = _build_messages(req.content, req.context, req.strict)
 
     try:
-        result = run_llm_with_retry(messages)
+        result = run_llm_with_hostname_fallback(messages)
     except Exception as e:
-        if _is_dns_like_error(e):
-            raise HTTPException(
-                status_code=503,
-                detail="opengradient gateway temporarily unavailable, please retry"
-            )
         raise HTTPException(status_code=500, detail=f"opengradient llm call failed: {e}")
 
     raw = getattr(result, "chat_output", None) or getattr(result, "completion_output", None)
@@ -333,7 +332,7 @@ def analyze(req: AnalyzeRequest):
             {"role": "user", "content": raw_text if raw_text else str(raw)},
         ]
         try:
-            repair = run_llm_with_retry(repair_messages)
+            repair = run_llm_with_hostname_fallback(repair_messages)
             repaired_raw = getattr(repair, "chat_output", None) or ""
             data = _safe_json_loads(repaired_raw)
         except Exception as e2:
@@ -376,6 +375,8 @@ def analyze(req: AnalyzeRequest):
         "verification": "tee",
         "model": str(OG_TEE_LLM_MODEL),
         "x402_settlement_mode": str(OG_X402_SETTLEMENT_MODE),
+        "gateway_hostname": OG_LLM_HOSTNAME,
+        "gateway_fallback_ip": OG_LLM_FALLBACK_IP,
         "generated_at_unix": int(time.time()),
     }
 
