@@ -3,8 +3,6 @@ import re
 import uuid
 import os
 import time
-import socket
-from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -26,10 +24,6 @@ if not OG_PRIVATE_KEY:
 OG_TEE_LLM_MODEL = os.environ.get("OG_TEE_LLM_MODEL", "GPT_4O")
 OG_OPG_APPROVAL_AMOUNT = float(os.environ.get("OG_OPG_APPROVAL_AMOUNT", "5.0"))
 OG_X402_SETTLEMENT_MODE = os.environ.get("OG_X402_SETTLEMENT_MODE", "SETTLE_METADATA")
-
-# hostname + ip fallback
-OG_LLM_HOSTNAME = os.environ.get("OG_LLM_HOSTNAME", "llm.opengradient.ai")
-OG_LLM_FALLBACK_IP = os.environ.get("OG_LLM_FALLBACK_IP", "3.15.214.21")
 
 TEE_LLM_MAP = {
     "GPT_4O": og.TEE_LLM.GPT_4O,
@@ -57,10 +51,7 @@ if SETTLEMENT_MODE is None:
         f"valid: {', '.join(SETTLEMENT_MAP.keys())}"
     )
 
-# initialize client
 client = og.init(private_key=OG_PRIVATE_KEY)
-
-# ensure approval once at boot
 client.llm.ensure_opg_approval(opg_amount=OG_OPG_APPROVAL_AMOUNT)
 
 # -----------------------------
@@ -246,39 +237,6 @@ def _normalize_flags(flags: Any) -> List[str]:
     return deduped
 
 
-@contextmanager
-def hostname_ip_fallback(hostname: str, fallback_ip: str):
-    original_getaddrinfo = socket.getaddrinfo
-
-    def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-        try:
-            return original_getaddrinfo(host, port, family, type, proto, flags)
-        except socket.gaierror:
-            if host == hostname and fallback_ip:
-                return original_getaddrinfo(fallback_ip, port, family, type, proto, flags)
-            raise
-
-    socket.getaddrinfo = patched_getaddrinfo
-    try:
-        yield
-    finally:
-        socket.getaddrinfo = original_getaddrinfo
-
-
-def run_llm_with_hostname_fallback(messages: List[Dict[str, str]], *, max_tokens: int = 650, temperature: float = 0.0):
-    with hostname_ip_fallback(OG_LLM_HOSTNAME, OG_LLM_FALLBACK_IP):
-        return client.llm.chat(
-            model=MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            x402_settlement_mode=SETTLEMENT_MODE,
-        )
-
-
-# -----------------------------
-# app
-# -----------------------------
 app = FastAPI(title="alpha filter agent", version="0.1.0")
 
 app.add_middleware(
@@ -314,7 +272,13 @@ def analyze(req: AnalyzeRequest):
     messages = _build_messages(req.content, req.context, req.strict)
 
     try:
-        result = run_llm_with_hostname_fallback(messages)
+        result = client.llm.chat(
+            model=MODEL,
+            messages=messages,
+            max_tokens=650,
+            temperature=0.0,
+            x402_settlement_mode=SETTLEMENT_MODE,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"opengradient llm call failed: {e}")
 
@@ -332,7 +296,13 @@ def analyze(req: AnalyzeRequest):
             {"role": "user", "content": raw_text if raw_text else str(raw)},
         ]
         try:
-            repair = run_llm_with_hostname_fallback(repair_messages)
+            repair = client.llm.chat(
+                model=MODEL,
+                messages=repair_messages,
+                max_tokens=650,
+                temperature=0.0,
+                x402_settlement_mode=SETTLEMENT_MODE,
+            )
             repaired_raw = getattr(repair, "chat_output", None) or ""
             data = _safe_json_loads(repaired_raw)
         except Exception as e2:
@@ -375,8 +345,6 @@ def analyze(req: AnalyzeRequest):
         "verification": "tee",
         "model": str(OG_TEE_LLM_MODEL),
         "x402_settlement_mode": str(OG_X402_SETTLEMENT_MODE),
-        "gateway_hostname": OG_LLM_HOSTNAME,
-        "gateway_fallback_ip": OG_LLM_FALLBACK_IP,
         "generated_at_unix": int(time.time()),
     }
 
